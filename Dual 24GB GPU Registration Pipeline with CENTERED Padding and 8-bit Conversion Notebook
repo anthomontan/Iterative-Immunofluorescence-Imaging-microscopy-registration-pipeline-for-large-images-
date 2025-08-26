@@ -1,0 +1,1266 @@
+"""
+ Dual 24GB GPU Registration Pipeline with CENTERED Padding and 8-bit Conversion
+ Proper transformation matrix inversion at the correct stage
+Update the paths in the configuration section then run !
+"""
+import os
+import re
+import time
+from pathlib import Path
+from dataclasses import dataclass
+from typing import List, Tuple, Dict, Optional, Any
+import numpy as np
+import pyvips
+import tifffile as tiff
+import torch
+import cv2
+from kornia.geometry.transform import warp_affine
+from kornia.feature import LoFTR
+from tqdm import tqdm
+import gc
+import threading
+import queue
+import math
+import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import matplotlib.pyplot as plt
+
+# ---------------- PADDING FUNCTIONS (CORRECT) ----------------
+def get_max_dimensions(input_dir: Path) -> Tuple[int, int]:
+    """Get maximum dimensions across all images"""
+    max_h, max_w = 0, 0
+    for f in input_dir.glob("*.tif"):
+        vimg = pyvips.Image.new_from_file(str(f), access="sequential")
+        max_h = max(max_h, vimg.height)
+        max_w = max(max_w, vimg.width)
+    return max_h, max_w
+
+def pad_image_to_size(img: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
+    """Pad image to target size with CENTERED padding"""
+    h, w = img.shape
+    if h == target_h and w == target_w:
+        return img
+    padded = np.zeros((target_h, target_w), dtype=img.dtype)
+    # CENTERED PADDING - CORRECT for proper alignment
+    y_offset = (target_h - h) // 2
+    x_offset = (target_w - w) // 2
+    padded[y_offset:y_offset+h, x_offset:x_offset+w] = img
+    return padded
+
+def pad_all_images(input_dir: Path, output_dir: Path, use_8bit: bool = False):
+    """Pad all images to maximum size with CENTERED padding"""
+    print("Finding maximum image dimensions...")
+    max_h, max_w = get_max_dimensions(input_dir)
+    print(f"Maximum dimensions: {max_h}x{max_w}")
+    
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for f in tqdm(sorted(input_dir.glob("*.tif")), desc="Padding images (CENTERED)"):
+        output_file = output_dir / f.name
+        if output_file.exists():
+            continue
+            
+        # Load image
+        vimg = pyvips.Image.new_from_file(str(f), access="sequential")
+        mem = vimg.write_to_memory()
+        img = np.ndarray(buffer=mem, dtype=np.uint16, shape=(vimg.height, vimg.width))
+        
+        # CENTERED pad to max size
+        padded_img = pad_image_to_size(img, max_h, max_w)
+        
+        # Convert to 8-bit if requested (for memory efficiency)
+        if use_8bit:
+            padded_img = (padded_img / 256).astype(np.uint8)
+        
+        # Save padded image
+        tiff.imwrite(str(output_file), padded_img, compression='lzw')
+    
+    return max_h, max_w
+
+# ---------------- ALIGNMENT METRICS ----------------
+def calculate_alignment_metrics(ref_img: np.ndarray, mov_img: np.ndarray, 
+                              transform_matrix: np.ndarray, is_8bit: bool = False) -> Dict[str, float]:
+    """
+    Calculate comprehensive alignment metrics between reference and moving image
+    
+    Args:
+        ref_img: Reference image (padded)
+        mov_img: Moving image (padded)
+        transform_matrix: Affine transformation matrix (2x3)
+        is_8bit: Whether images are 8-bit
+    
+    Returns:
+        Dictionary of alignment metrics
+    """
+    metrics = {}
+    
+    # Apply transformation to moving image
+    h, w = ref_img.shape
+    transform_tensor = torch.tensor(transform_matrix).unsqueeze(0)
+    
+    # Create grid for transformation
+    y_coords = torch.arange(0, h, dtype=torch.float32)
+    x_coords = torch.arange(0, w, dtype=torch.float32)
+    yy, xx = torch.meshgrid(y_coords, x_coords, indexing='ij')
+    coords = torch.stack([xx, yy], dim=0).unsqueeze(0)  # [1, 2, H, W]
+    
+    # Apply transformation to coordinates
+    coords_flat = coords.view(1, 2, -1)
+    ones = torch.ones(1, 1, coords_flat.shape[2])
+    coords_homogeneous = torch.cat([coords_flat, ones], dim=1)
+    transformed_coords = torch.bmm(transform_tensor[:, :2, :], coords_homogeneous)
+    transformed_coords = transformed_coords.view(1, 2, h, w)
+    
+    # Create normalized grid for sampling
+    norm_coords = transformed_coords.clone()
+    norm_coords[0, 0, :, :] = 2.0 * norm_coords[0, 0, :, :] / (w - 1) - 1.0
+    norm_coords[0, 1, :, :] = 2.0 * norm_coords[0, 1, :, :] / (h - 1) - 1.0
+    grid = norm_coords.permute(0, 2, 3, 1)
+    
+    # Sample transformed image
+    if is_8bit:
+        max_val = 255.0
+    else:
+        max_val = 65535.0
+        
+    mov_tensor = torch.from_numpy(mov_img).unsqueeze(0).unsqueeze(0).float() / max_val
+    transformed_mov = torch.nn.functional.grid_sample(
+        mov_tensor, grid, mode='bilinear', padding_mode='zeros', align_corners=True
+    )
+    transformed_mov = transformed_mov.squeeze().numpy() * max_val
+    
+    # Calculate metrics
+    # Cross-correlation (higher is better)
+    ref_normalized = (ref_img - np.mean(ref_img)) / (np.std(ref_img) + 1e-8)
+    mov_normalized = (transformed_mov - np.mean(transformed_mov)) / (np.std(transformed_mov) + 1e-8)
+    correlation = np.mean(ref_normalized * mov_normalized)
+    metrics["cross_correlation"] = float(correlation)
+    
+    # Mean Squared Error (lower is better)
+    mse = np.mean((ref_img - transformed_mov) ** 2)
+    metrics["mse"] = float(mse)
+    
+    # Check if alignment is within acceptable thresholds
+    if is_8bit:
+        max_val = 255.0
+    else:
+        max_val = 65535.0
+        
+    metrics["alignment_valid"] = correlation > 0.7 and mse < (max_val * 0.1) ** 2
+    
+    return metrics
+
+def visualize_alignment(ref_img: np.ndarray, mov_img: np.ndarray, 
+                       transform_matrix: np.ndarray, output_path: Path, 
+                       round_key: str, channel: str, is_8bit: bool = False):
+    """
+    Create visualization of alignment quality for debugging
+    
+    Args:
+        ref_img: Reference image
+        mov_img: Moving image
+        transform_matrix: Transformation matrix
+        output_path: Path to save visualization
+        round_key: Round identifier
+        channel: Channel identifier
+        is_8bit: Whether images are 8-bit
+    """
+    h, w = ref_img.shape
+    
+    # Apply transformation to moving image
+    transform_tensor = torch.tensor(transform_matrix).unsqueeze(0)
+    
+    # Create grid for transformation
+    y_coords = torch.arange(0, h, dtype=torch.float32)
+    x_coords = torch.arange(0, w, dtype=torch.float32)
+    yy, xx = torch.meshgrid(y_coords, x_coords, indexing='ij')
+    coords = torch.stack([xx, yy], dim=0).unsqueeze(0)  # [1, 2, H, W]
+    
+    # Apply transformation to coordinates
+    coords_flat = coords.view(1, 2, -1)
+    ones = torch.ones(1, 1, coords_flat.shape[2])
+    coords_homogeneous = torch.cat([coords_flat, ones], dim=1)
+    transformed_coords = torch.bmm(transform_tensor[:, :2, :], coords_homogeneous)
+    transformed_coords = transformed_coords.view(1, 2, h, w)
+    
+    # Create normalized grid for sampling
+    norm_coords = transformed_coords.clone()
+    norm_coords[0, 0, :, :] = 2.0 * norm_coords[0, 0, :, :] / (w - 1) - 1.0
+    norm_coords[0, 1, :, :] = 2.0 * norm_coords[0, 1, :, :] / (h - 1) - 1.0
+    grid = norm_coords.permute(0, 2, 3, 1)
+    
+    # Sample transformed image
+    if is_8bit:
+        max_val = 255.0
+    else:
+        max_val = 65535.0
+        
+    mov_tensor = torch.from_numpy(mov_img).unsqueeze(0).unsqueeze(0).float() / max_val
+    transformed_mov = torch.nn.functional.grid_sample(
+        mov_tensor, grid, mode='bilinear', padding_mode='zeros', align_corners=True
+    )
+    transformed_mov = transformed_mov.squeeze().numpy() * max_val
+    
+    # Create composite image for visualization
+    plt.figure(figsize=(15, 10))
+    
+    # Plot 1: Reference image
+    plt.subplot(2, 3, 1)
+    plt.imshow(ref_img, cmap='gray')
+    plt.title(f"Reference (Round {round_key})")
+    plt.axis('off')
+    
+    # Plot 2: Moving image (before transformation)
+    plt.subplot(2, 3, 2)
+    plt.imshow(mov_img, cmap='gray')
+    plt.title(f"Moving (Before) - {channel}")
+    plt.axis('off')
+    
+    # Plot 3: Moving image (after transformation)
+    plt.subplot(2, 3, 3)
+    plt.imshow(transformed_mov, cmap='gray')
+    plt.title(f"Moving (After) - {channel}")
+    plt.axis('off')
+    
+    # Plot 4: Overlay (red=reference, green=transformed moving)
+    overlay = np.zeros((h, w, 3), dtype=np.uint8)
+    
+    if is_8bit:
+        ref_norm = ref_img.astype(np.uint8)
+        mov_norm = transformed_mov.astype(np.uint8)
+    else:
+        ref_norm = (ref_img / 256).astype(np.uint8)
+        mov_norm = (transformed_mov / 256).astype(np.uint8)
+    
+    overlay[:,:,0] = ref_norm  # Red channel = reference
+    overlay[:,:,1] = mov_norm  # Green channel = transformed moving
+    overlay[:,:,2] = np.zeros_like(ref_norm)  # Blue channel = 0
+    
+    plt.subplot(2, 3, 4)
+    plt.imshow(overlay)
+    plt.title("Alignment Overlay (Red=Ref, Green=Mov)")
+    plt.axis('off')
+    
+    # Plot 5: Difference image
+    diff = np.abs(ref_img.astype(np.float32) - transformed_mov.astype(np.float32))
+    if is_8bit:
+        diff = (diff / 255.0 * 255).astype(np.uint8)
+    else:
+        diff = (diff / 65535.0 * 255).astype(np.uint8)
+    
+    plt.subplot(2, 3, 5)
+    plt.imshow(diff, cmap='hot')
+    plt.title("Absolute Difference")
+    plt.colorbar()
+    plt.axis('off')
+    
+    plt.tight_layout()
+    plt.savefig(str(output_path), dpi=150, bbox_inches='tight')
+    plt.close()
+
+# ---------------- CONFIG ----------------
+@dataclass
+class DualGPUConfig:
+    input_folder: str
+    output_folder: str
+    cache_folder: str
+    reference_dapi_file: str
+    gpu_devices: List[int] = None
+    parallelization_strategy: str = "rounds"
+    use_padding: bool = True
+    use_8bit_processing: bool = True  # Enable 8-bit conversion for memory efficiency
+    coarse_downscale: float = 0.15
+    apply_clahe: bool = True
+    clahe_clip: float = 15.0
+    clahe_grid: Tuple[int, int] = (8, 8)
+    max_full_image_pixels: int = 10000000
+    patch_size: int = 512
+    patch_overlap: float = 0.25
+    mixed_precision: bool = True
+    max_transform_memory_gb: float = 2.5
+    tile_size_large: int = 4096
+    tile_overlap: int = 128
+    min_tile_size: int = 512
+    max_h: int = 0
+    max_w: int = 0
+    
+    def __post_init__(self):
+        if self.gpu_devices is None:
+            self.gpu_devices = [0, 1]
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA not available")
+        gpu_count = torch.cuda.device_count()
+        if len(self.gpu_devices) > gpu_count:
+            raise RuntimeError(f"Requested {len(self.gpu_devices)} GPUs but only {gpu_count} available")
+        print(f"Using GPUs: {self.gpu_devices}")
+        for gpu_id in self.gpu_devices:
+            name = torch.cuda.get_device_name(gpu_id)
+            memory = torch.cuda.get_device_properties(gpu_id).total_memory / 1e9
+            print(f"  GPU {gpu_id}: {name} ({memory:.1f}GB)")
+        print(f"Parallelization strategy: {self.parallelization_strategy}")
+        print(f"8-bit processing: {self.use_8bit_processing}")
+        os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+        
+        # Handle padding
+        if self.use_padding:
+            self._setup_padding()
+    
+    def _setup_padding(self):
+        """Setup CENTERED padding by creating padded versions of all images"""
+        input_path = Path(self.input_folder)
+        padded_path = input_path / "padded_images"
+        print(f"CENTERED padding strategy enabled")
+        print(f"Original images: {self.input_folder}")
+        print(f"Padded images: {padded_path}")
+        
+        # Create padded images if they don't exist
+        if not padded_path.exists() or len(list(padded_path.glob("*.tif"))) == 0:
+            print(f"Creating CENTERED padded images (8-bit: {self.use_8bit_processing})...")
+            self.max_h, self.max_w = pad_all_images(input_path, padded_path, self.use_8bit_processing)
+        else:
+            print(f"Using existing CENTERED padded images (8-bit: {self.use_8bit_processing})")
+            # Try to get dimensions from existing padded images
+            first_file = next(padded_path.glob("*.tif"), None)
+            if first_file:
+                vimg = pyvips.Image.new_from_file(str(first_file), access="sequential")
+                self.max_h, self.max_w = vimg.height, vimg.width
+        
+        # Update paths to use padded images
+        self.input_folder = str(padded_path)
+        
+        # Update reference file path
+        ref_path = Path(self.reference_dapi_file)
+        self.reference_dapi_file = str(padded_path / ref_path.name)
+        
+        print(f"Updated input folder: {self.input_folder}")
+        print(f"Updated reference file: {self.reference_dapi_file}")
+        print(f"Canvas size: {self.max_h}x{self.max_w}")
+
+# ---------------- UTILITIES ----------------
+def cleanup_memory(device_id: Optional[int] = None):
+    if torch.cuda.is_available():
+        if device_id is not None:
+            with torch.cuda.device(device_id):
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+        else:
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+    gc.collect()
+
+def get_gpu_memory_info(device_id: int):
+    if torch.cuda.is_available():
+        with torch.cuda.device(device_id):
+            allocated = torch.cuda.memory_allocated() / 1e9
+            reserved = torch.cuda.memory_reserved() / 1e9
+            total = torch.cuda.get_device_properties(device_id).total_memory / 1e9
+            free = total - reserved
+            return allocated, reserved, free
+    return 0, 0, 0
+
+def ensure_dir(p: Path):
+    p.mkdir(parents=True, exist_ok=True)
+
+def get_round_key(stem: str) -> str:
+    if "_Merged_" in stem:
+        return stem.split("_Merged_")[0]
+    m = re.match(r"(.+)_ch\d{2}$", stem)
+    return m.group(1) if m else stem
+
+def group_rounds(input_dir: Path) -> Dict[str, List[Path]]:
+    files = sorted(input_dir.glob("*.tif"))
+    rounds: Dict[str, List[Path]] = {}
+    for f in files:
+        rounds.setdefault(get_round_key(f.stem), []).append(f)
+    for k in rounds:
+        rounds[k] = sorted(rounds[k], key=lambda p: p.stem)
+    return rounds
+
+def load_tif_vips(path: Path, downscale: float = 1.0, is_8bit: bool = False) -> np.ndarray:
+    """Load TIFF with proper handling of 8-bit and 16-bit image formats"""
+    vimg = pyvips.Image.new_from_file(str(path), access="sequential")
+    if downscale != 1.0:
+        vimg = vimg.resize(downscale)
+    
+    # Check the actual image format
+    if vimg.format == 'uchar':  # 8-bit image
+        mem = vimg.write_to_memory()
+        img = np.ndarray(buffer=mem, dtype=np.uint8, shape=(vimg.height, vimg.width))
+        
+        if is_8bit:
+            return img.astype(np.float32, copy=False)
+        else:
+            # Convert 8-bit to 16-bit range for processing
+            return (img.astype(np.float32) * 256).astype(np.uint16)
+    else:  # Assume 16-bit image
+        mem = vimg.write_to_memory()
+        img = np.ndarray(buffer=mem, dtype=np.uint16, shape=(vimg.height, vimg.width))
+        
+        if is_8bit:
+            # Convert 16-bit to 8-bit
+            return (img / 256).astype(np.uint8).astype(np.float32, copy=False)
+        else:
+            return img.astype(np.float32, copy=False)
+
+def save_tif(path: Path, img: np.ndarray, save_as_8bit: bool = False):
+    """Save TIFF with option to use 8-bit compression"""
+    ensure_dir(path.parent)
+    if save_as_8bit:
+        # Save as 8-bit TIFF (smaller file size)
+        tiff.imwrite(str(path), img.astype(np.uint8), compression='lzw')
+    else:
+        # Save as 16-bit TIFF (preserves full precision)
+        tiff.imwrite(str(path), img.astype(np.uint16), compression='lzw')
+
+def to_gpu_tensor(img: np.ndarray, device: torch.device, 
+                 dtype=torch.float32, is_8bit: bool = False) -> torch.Tensor:
+    """Convert to GPU tensor with appropriate normalization"""
+    if is_8bit:
+        # For 8-bit images, normalize by 255.0
+        return torch.from_numpy((img / 255.0).astype(np.float32, copy=False)).unsqueeze(0).unsqueeze(0).to(device, dtype=dtype)
+    else:
+        # For 16-bit images, normalize by 65535.0
+        return torch.from_numpy((img / 65535.0).astype(np.float32, copy=False)).unsqueeze(0).unsqueeze(0).to(device, dtype=dtype)
+
+def from_gpu_tensor(t: torch.Tensor, is_8bit: bool = False) -> np.ndarray:
+    """Convert from GPU tensor with appropriate scaling"""
+    arr = t.squeeze().detach().cpu().numpy()
+    if is_8bit:
+        return (arr * 255.0).clip(0, 255).astype(np.uint8)
+    else:
+        return (arr * 65535.0).clip(0, 65535).astype(np.uint16)
+
+def cpu_clahe(img: np.ndarray, clip_limit: float, grid_size: Tuple[int, int], is_8bit: bool = False) -> np.ndarray:
+    """CLAHE enhancement with proper handling for 8-bit or 16-bit images"""
+    if is_8bit:
+        clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=grid_size)
+        return clahe.apply(img.astype(np.uint8))
+    else:
+        clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=grid_size)
+        img_uint16 = img.astype(np.uint16)
+        img_clahe = clahe.apply(np.clip(img_uint16, 0, 65535))
+        return img_clahe.astype(np.float32)
+
+# ---------------- FIXED: No Gaps Tiled Transformation ----------------
+def transform_image_tiled_gpu_no_gaps(img: np.ndarray, transform_matrix: torch.Tensor, 
+                                     device_id: int, cfg: DualGPUConfig, 
+                                     progress_prefix: str = "") -> np.ndarray:
+    """Transform tiles with proper spatial coordination - NO GAPS"""
+    h, w = img.shape
+    device = torch.device(f"cuda:{device_id}")
+    
+    with torch.cuda.device(device_id):
+        allocated, reserved, free_memory = get_gpu_memory_info(device_id)
+        usable_memory = min(free_memory * 0.4, cfg.max_transform_memory_gb)
+        memory_per_pixel = 4 * 5 / 1e9
+        max_pixels_per_tile = int(usable_memory / memory_per_pixel)
+        
+        if h * w > 500000000:
+            base_tile_size = cfg.tile_size_large
+        else:
+            base_tile_size = 2048
+            
+        tile_size = min(base_tile_size, int(math.sqrt(max_pixels_per_tile)))
+        tile_size = max(cfg.min_tile_size, tile_size)
+        
+        # Use non-overlapping tiles to prevent gaps
+        stride = tile_size  # NO OVERLAP in processing grid
+        tiles_x = math.ceil(w / stride)
+        tiles_y = math.ceil(h / stride)
+        
+        print(f"{progress_prefix}GPU {device_id}: Processing {tiles_x}x{tiles_y} NON-OVERLAPPING tiles")
+        
+        # Initialize output
+        result = np.zeros((h, w), dtype=np.float32)
+        transform_gpu = transform_matrix.to(device)
+        
+        # Convert full image to GPU tensor once
+        img_tensor = to_gpu_tensor(img, device, is_8bit=cfg.use_8bit_processing)
+        
+        # Process tiles in regular grid WITHOUT gaps
+        for tile_y in tqdm(range(tiles_y), desc=f"{progress_prefix}GPU{device_id}", leave=False):
+            for tile_x in range(tiles_x):
+                try:
+                    # Calculate exact tile bounds
+                    y_start = tile_y * stride
+                    x_start = tile_x * stride
+                    y_end = min(y_start + tile_size, h)
+                    x_end = min(x_start + tile_size, w)
+                    
+                    if (y_end - y_start) < 32 or (x_end - x_start) < 32:
+                        continue
+                        
+                    tile_h = y_end - y_start
+                    tile_w = x_end - x_start
+                    
+                    # Create coordinate grid for this tile in GLOBAL coordinates
+                    y_coords = torch.arange(y_start, y_end, dtype=torch.float32, device=device)
+                    x_coords = torch.arange(x_start, x_end, dtype=torch.float32, device=device)
+                    yy, xx = torch.meshgrid(y_coords, x_coords, indexing='ij')
+                    
+                    # Stack coordinates: [2, H, W] where 2 = (x, y)
+                    coords = torch.stack([xx, yy], dim=0).unsqueeze(0)  # [1, 2, H, W]
+                    
+                    # Apply transformation to coordinates
+                    coords_flat = coords.view(1, 2, -1)  # [1, 2, H*W]
+                    ones = torch.ones(1, 1, coords_flat.shape[2], device=device)
+                    coords_homogeneous = torch.cat([coords_flat, ones], dim=1)  # [1, 3, H*W]
+                    
+                    # Apply transformation: [1, 2, 3] @ [1, 3, H*W] -> [1, 2, H*W]
+                    transformed_coords = torch.bmm(transform_gpu[:, :2, :], coords_homogeneous)
+                    transformed_coords = transformed_coords.view(1, 2, tile_h, tile_w)
+                    
+                    # Normalize coordinates to [-1, 1] for grid_sample
+                    norm_coords = transformed_coords.clone()
+                    norm_coords[0, 0, :, :] = 2.0 * norm_coords[0, 0, :, :] / (w - 1) - 1.0  # x
+                    norm_coords[0, 1, :, :] = 2.0 * norm_coords[0, 1, :, :] / (h - 1) - 1.0  # y
+                    
+                    # Rearrange for grid_sample: [N, H, W, 2]
+                    grid = norm_coords.permute(0, 2, 3, 1)  # [1, H, W, 2]
+                    
+                    # Sample from original image using transformed coordinates
+                    transformed_tile = torch.nn.functional.grid_sample(
+                        img_tensor, grid, mode='bilinear', padding_mode='zeros', align_corners=True
+                    )
+                    
+                    # Convert back and place in result
+                    tile_result = from_gpu_tensor(transformed_tile, is_8bit=cfg.use_8bit_processing).astype(np.float32)
+                    
+                    # Place tile directly in result (no blending to avoid gaps)
+                    result[y_start:y_end, x_start:x_end] = tile_result
+                    
+                    # Cleanup
+                    del coords, transformed_coords, grid, transformed_tile, tile_result
+                    cleanup_memory(device_id)
+                    
+                except Exception as e:
+                    print(f"{progress_prefix}GPU {device_id}: Error in tile ({tile_x},{tile_y}): {e}")
+                    cleanup_memory(device_id)
+                    continue
+        
+        # Cleanup
+        del img_tensor
+        
+        # Convert to appropriate bit depth
+        if cfg.use_8bit_processing:
+            transformed_full = result.astype(np.uint8)
+        else:
+            transformed_full = result.astype(np.uint16)
+            
+        del result
+        cleanup_memory(device_id)
+        
+        return transformed_full
+
+# ---------------- Preprocessing ----------------
+def preprocess_dapi_cpu(cfg: DualGPUConfig):
+    input_dir = Path(cfg.input_folder)
+    cache_dir = Path(cfg.cache_folder)
+    ensure_dir(cache_dir)
+    preproc_files = {}
+    
+    for f in tqdm(sorted(input_dir.glob("*_ch00.tif")), desc="Preprocessing DAPI"):
+        cache_file = cache_dir / f"{f.stem}_preproc.tif"
+        if cache_file.exists():
+            preproc_files[f.stem] = cache_file
+            continue
+            
+        img = load_tif_vips(f, is_8bit=cfg.use_8bit_processing)
+        if cfg.apply_clahe:
+            img = cpu_clahe(img, cfg.clahe_clip, cfg.clahe_grid, is_8bit=cfg.use_8bit_processing)
+            
+        img_down = cv2.resize(img, None, fx=cfg.coarse_downscale, fy=cfg.coarse_downscale)
+        save_tif(cache_file, img_down, save_as_8bit=cfg.use_8bit_processing)
+        preproc_files[f.stem] = cache_file
+        
+    return preproc_files
+
+# ---------------- Single GPU Components ----------------
+class GPUFeatureMatcher:
+    def __init__(self, device_id: int, is_8bit: bool = False):
+        self.device = torch.device(f"cuda:{device_id}")
+        self.device_id = device_id
+        self.is_8bit = is_8bit
+    
+    @torch.inference_mode()
+    def coarse_align(self, ref: torch.Tensor, mov: torch.Tensor) -> torch.Tensor:
+        with torch.cuda.device(self.device_id):
+            # Scale to 0-255 for ECC
+            if self.is_8bit:
+                scale_factor = 1.0
+            else:
+                scale_factor = 255.0 / 65535.0
+                
+            ref_np = (ref.squeeze().cpu().numpy() * scale_factor).astype(np.uint8)
+            mov_np = (mov.squeeze().cpu().numpy() * scale_factor).astype(np.uint8)
+            
+            M = np.eye(2, 3, dtype=np.float32)
+            try:
+                _, M = cv2.findTransformECC(ref_np, mov_np, M, cv2.MOTION_AFFINE,
+                                            (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 200, 1e-6))
+            except Exception:
+                pass
+            return torch.tensor(M, dtype=torch.float32, device=self.device)
+
+class GPULoFTRMatcher:
+    def __init__(self, device_id: int, cfg: DualGPUConfig):
+        self.device_id = device_id
+        self.device = torch.device(f"cuda:{device_id}")
+        self.cfg = cfg
+        self.matcher = None
+        self.is_8bit = cfg.use_8bit_processing
+    
+    def _get_matcher(self):
+        if self.matcher is None:
+            with torch.cuda.device(self.device_id):
+                self.matcher = LoFTR(pretrained='outdoor').to(self.device)
+                self.matcher.eval()
+        return self.matcher
+    
+    @torch.inference_mode()
+    def match_images_patch_based_fixed(self, ref: np.ndarray, mov: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Match images using patch-based approach for large images"""
+        h, w = ref.shape
+        patch_size = self.cfg.patch_size
+        overlap = int(patch_size * self.cfg.patch_overlap)
+        stride = patch_size - overlap
+        matcher = self._get_matcher()
+        dtype = torch.float16 if self.cfg.mixed_precision else torch.float32
+        all_kpts0 = []
+        all_kpts1 = []
+        
+        for y in range(0, h - patch_size + 1, stride):
+            for x in range(0, w - patch_size + 1, stride):
+                y_end = min(y + patch_size, h)
+                x_end = min(x + patch_size, w)
+                if (y_end - y) < patch_size * 0.7 or (x_end - x) < patch_size * 0.7:
+                    continue
+                
+                try:
+                    ref_patch = ref[y:y_end, x:x_end]
+                    mov_patch = mov[y:y_end, x:x_end]
+                    
+                    # Adjust threshold based on bit depth
+                    if self.is_8bit:
+                        std_threshold = 20
+                    else:
+                        std_threshold = 500
+                        
+                    if ref_patch.std() < std_threshold or mov_patch.std() < std_threshold:
+                        continue
+                        
+                    ref_tensor = to_gpu_tensor(ref_patch, self.device, dtype, is_8bit=self.is_8bit)
+                    mov_tensor = to_gpu_tensor(mov_patch, self.device, dtype, is_8bit=self.is_8bit)
+                    input_dict = {"image0": ref_tensor, "image1": mov_tensor}
+                    
+                    if self.cfg.mixed_precision:
+                        with torch.cuda.amp.autocast():
+                            correspondences = matcher(input_dict)
+                    else:
+                        correspondences = matcher(input_dict)
+                    
+                    if 'keypoints0' in correspondences and len(correspondences['keypoints0']) >= 10:
+                        kpts0 = correspondences['keypoints0'].cpu().numpy()
+                        kpts1 = correspondences['keypoints1'].cpu().numpy()
+                        kpts0[:, 0] += x
+                        kpts0[:, 1] += y
+                        kpts1[:, 0] += x
+                        kpts1[:, 1] += y
+                        
+                        all_kpts0.append(kpts0)
+                        all_kpts1.append(kpts1)
+                    
+                    del ref_tensor, mov_tensor, correspondences
+                    cleanup_memory(self.device_id)
+                except Exception:
+                    cleanup_memory(self.device_id)
+                    continue
+        
+        if len(all_kpts0) > 0:
+            final_kpts0 = np.vstack(all_kpts0)
+            final_kpts1 = np.vstack(all_kpts1)
+            
+            if len(final_kpts0) > 100:
+                try:
+                    M_cv, inliers = cv2.estimateAffinePartial2D(
+                        final_kpts1.astype(np.float32),
+                        final_kpts0.astype(np.float32),
+                        method=cv2.RANSAC,
+                        ransacReprojThreshold=3.0,
+                        maxIters=2000,
+                        confidence=0.99
+                    )
+                    if inliers is not None and inliers.sum() > 50:
+                        mask = inliers.flatten().astype(bool)
+                        final_kpts0 = final_kpts0[mask]
+                        final_kpts1 = final_kpts1[mask]
+                except Exception:
+                    pass
+            
+            return final_kpts0, final_kpts1
+        else:
+            return np.array([]).reshape(0, 2), np.array([]).reshape(0, 2)
+
+    @torch.inference_mode()
+    def match_images(self, ref: np.ndarray, mov: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Match images with fallback to patch-based approach if needed"""
+        with torch.cuda.device(self.device_id):
+            try:
+                dtype = torch.float16 if self.cfg.mixed_precision else torch.float32
+                matcher = self._get_matcher()
+                ref_tensor = to_gpu_tensor(ref, self.device, dtype, is_8bit=self.is_8bit)
+                mov_tensor = to_gpu_tensor(mov, self.device, dtype, is_8bit=self.is_8bit)
+                input_dict = {"image0": ref_tensor, "image1": mov_tensor}
+                
+                if self.cfg.mixed_precision:
+                    with torch.cuda.amp.autocast():
+                        correspondences = matcher(input_dict)
+                else:
+                    correspondences = matcher(input_dict)
+                
+                if 'keypoints0' not in correspondences or len(correspondences['keypoints0']) == 0:
+                    cleanup_memory(self.device_id)
+                    return self.match_images_patch_based_fixed(ref, mov)
+                
+                kpts0 = correspondences['keypoints0'].cpu().numpy()
+                kpts1 = correspondences['keypoints1'].cpu().numpy()
+                del ref_tensor, mov_tensor, correspondences
+                cleanup_memory(self.device_id)
+                return kpts0, kpts1
+            except torch.cuda.OutOfMemoryError:
+                cleanup_memory(self.device_id)
+                return self.match_images_patch_based_fixed(ref, mov)
+            except Exception:
+                cleanup_memory(self.device_id)
+                return np.array([]).reshape(0, 2), np.array([]).reshape(0, 2)
+
+    def cleanup(self):
+        if self.matcher is not None:
+            del self.matcher
+            self.matcher = None
+        cleanup_memory(self.device_id)
+
+# ---------------- Strategy 1: Parallel Rounds ----------------
+def process_single_round(round_data, cfg: DualGPUConfig, ref_full: np.ndarray, 
+                        preproc_cache: Dict[str, Path], device_id: int):
+    round_key, files = round_data
+    try:
+        dapi_file = next((f for f in files if "_ch00.tif" in f.name), None)
+        if dapi_file is None:
+            return f"No DAPI file found in round {round_key}"
+        
+        with torch.cuda.device(device_id):
+            device = torch.device(f"cuda:{device_id}")
+            dapi_small = load_tif_vips(preproc_cache[dapi_file.stem], is_8bit=cfg.use_8bit_processing)
+            ref_small = cv2.resize(ref_full, (dapi_small.shape[1], dapi_small.shape[0]))
+            
+            ref_t = to_gpu_tensor(ref_small, device, is_8bit=cfg.use_8bit_processing)
+            mov_t = to_gpu_tensor(dapi_small, device, is_8bit=cfg.use_8bit_processing)
+            M_coarse = GPUFeatureMatcher(device_id, is_8bit=cfg.use_8bit_processing).coarse_align(ref_t, mov_t).unsqueeze(0)
+            
+            # CRITICAL FIX: Invert the transformation matrix here
+            M_homogeneous = torch.eye(3, dtype=torch.float32, device=device)
+            M_homogeneous[:2, :] = M_coarse[0]
+            M_inv = torch.inverse(M_homogeneous)
+            M_forward = M_inv[:2, :].unsqueeze(0)
+            
+            # Now apply the CORRECT transformation (forward mapping)
+            dapi_warped_t = warp_affine(mov_t, M_forward, mov_t.shape[2:], mode='bilinear', padding_mode='reflection')
+            dapi_warped = from_gpu_tensor(dapi_warped_t, is_8bit=cfg.use_8bit_processing).astype(np.float32)
+            del ref_t, mov_t, dapi_warped_t
+            cleanup_memory(device_id)
+            
+            loftr_matcher = GPULoFTRMatcher(device_id, cfg)
+            keypoints_ref, keypoints_mov = loftr_matcher.match_images(ref_small, dapi_warped)
+            loftr_matcher.cleanup()
+            
+            M_final = M_coarse.clone()
+            if len(keypoints_ref) > 10:
+                try:
+                    M_cv, inliers = cv2.estimateAffinePartial2D(
+                        keypoints_mov.astype(np.float32),
+                        keypoints_ref.astype(np.float32),
+                        method=cv2.RANSAC,
+                        ransacReprojThreshold=2.0
+                    )
+                    if M_cv is not None and inliers.sum() > 5:
+                        M_final = torch.tensor(M_cv, dtype=torch.float32, device=device).unsqueeze(0)
+                except Exception:
+                    pass
+            
+            # CRITICAL FIX: Invert the final transformation matrix
+            M_homogeneous = torch.eye(3, dtype=torch.float32, device=device)
+            M_homogeneous[:2, :] = M_final[0]
+            M_inv = torch.inverse(M_homogeneous)
+            M_forward = M_inv[:2, :]
+            
+            # Scale up to full resolution
+            scale_factor = 1.0 / cfg.coarse_downscale
+            M_full = M_forward.clone().unsqueeze(0)
+            M_full[0, :2, 2] *= scale_factor
+            
+            # Calculate alignment metrics
+            alignment_metrics = calculate_alignment_metrics(
+                ref_full, load_tif_vips(dapi_file, is_8bit=cfg.use_8bit_processing), 
+                M_full[0].cpu().numpy(),
+                is_8bit=cfg.use_8bit_processing
+            )
+            
+            # Create validation directory
+            validation_dir = Path(cfg.output_folder) / "validation"
+            validation_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Create visualization
+            viz_path = validation_dir / f"alignment_visualization_{round_key}_ch00.png"
+            visualize_alignment(
+                ref_full, 
+                load_tif_vips(dapi_file, is_8bit=cfg.use_8bit_processing), 
+                M_full[0].cpu().numpy(),
+                viz_path,
+                round_key,
+                "DAPI",
+                is_8bit=cfg.use_8bit_processing
+            )
+            
+            # Check if alignment is acceptable
+            if not alignment_metrics.get("alignment_valid", False):
+                print(f"WARNING: Poor alignment detected for round {round_key} (DAPI)")
+                print(f"  Cross-correlation: {alignment_metrics.get('cross_correlation', 0):.4f}")
+                print(f"  MSE: {alignment_metrics.get('mse', 0):.2f}")
+                print(f"  Check visualization at: {viz_path}")
+            
+            # Transform all channels
+            for i, f in enumerate(files):
+                try:
+                    full_img = load_tif_vips(f, is_8bit=cfg.use_8bit_processing)
+                    channel_name = f.stem.split('_')[-1] if '_ch' in f.stem else "unknown"
+                    
+                    # Transform image
+                    transformed_img = transform_image_tiled_gpu_no_gaps(
+                        full_img, M_full, device_id, cfg,
+                        progress_prefix=f"Round {round_key} Ch{i+1}: "
+                    )
+                    
+                    # Save transformed image
+                    output_path = Path(cfg.output_folder) / f"{f.stem}_registered.tif"
+                    save_tif(output_path, transformed_img, save_as_8bit=cfg.use_8bit_processing)
+                    
+                    del full_img, transformed_img
+                    cleanup_memory(device_id)
+                except Exception as e:
+                    print(f"Error transforming channel {i+1} of round {round_key}: {e}")
+                    cleanup_memory(device_id)
+        
+        return f"GPU {device_id}: Round {round_key} completed successfully"
+    except Exception as e:
+        cleanup_memory(device_id)
+        return f"GPU {device_id}: Round {round_key} failed: {e}"
+
+def run_parallel_rounds_strategy(cfg: DualGPUConfig):
+    print("=== Parallel Rounds Strategy (CENTERED PADDED, NO GAPS) ===")
+    preproc_cache = preprocess_dapi_cpu(cfg)
+    ref_full = load_tif_vips(Path(cfg.reference_dapi_file), is_8bit=cfg.use_8bit_processing)
+    
+    if cfg.apply_clahe:
+        ref_full = cpu_clahe(ref_full, cfg.clahe_clip, cfg.clahe_grid, is_8bit=cfg.use_8bit_processing)
+    print(f"CENTERED padded reference image shape: {ref_full.shape}")
+    
+    rounds = group_rounds(Path(cfg.input_folder))
+    round_items = list(rounds.items())
+    
+    with ThreadPoolExecutor(max_workers=len(cfg.gpu_devices)) as executor:
+        future_to_round = {}
+        for i, round_data in enumerate(round_items):
+            gpu_id = cfg.gpu_devices[i % len(cfg.gpu_devices)]
+            future = executor.submit(process_single_round, round_data, cfg, ref_full, preproc_cache, gpu_id)
+            future_to_round[future] = round_data[0]
+        
+        results = []
+        for future in tqdm(as_completed(future_to_round), total=len(future_to_round), desc="Rounds"):
+            round_key = future_to_round[future]
+            try:
+                result = future.result()
+                print(result)
+                results.append(result)
+            except Exception as e:
+                error_msg = f"Round {round_key} generated an exception: {e}"
+                print(error_msg)
+                results.append(error_msg)
+        
+        # Generate summary report
+        summary_path = Path(cfg.output_folder) / "alignment_summary.json"
+        success_count = sum(1 for r in results if "completed successfully" in r)
+        
+        summary = {
+            "total_rounds": len(rounds),
+            "successful_rounds": success_count,
+            "failed_rounds": len(rounds) - success_count,
+            "results": results,
+            "timestamp": time.time()
+        }
+        
+        with open(str(summary_path), 'w') as f:
+            json.dump(summary, f, indent=2)
+        
+        print(f"\nAlignment Summary:")
+        print(f"  Total rounds: {len(rounds)}")
+        print(f"  Successful: {success_count}")
+        print(f"  Failed: {len(rounds) - success_count}")
+        print(f"  Summary report saved to: {summary_path}")
+
+# ---------------- Strategy 2: Pipeline Parallelization ----------------
+def run_pipeline_strategy(cfg: DualGPUConfig):
+    print("=== Pipeline Strategy (CENTERED PADDED, NO GAPS) ===")
+    preproc_cache = preprocess_dapi_cpu(cfg)
+    ref_full = load_tif_vips(Path(cfg.reference_dapi_file), is_8bit=cfg.use_8bit_processing)
+    
+    if cfg.apply_clahe:
+        ref_full = cpu_clahe(ref_full, cfg.clahe_clip, cfg.clahe_grid, is_8bit=cfg.use_8bit_processing)
+    print(f"CENTERED padded reference image shape: {ref_full.shape}")
+    
+    rounds = group_rounds(Path(cfg.input_folder))
+    transform_queue = queue.Queue(maxsize=1)
+    
+    def matching_worker():
+        device_id = cfg.gpu_devices[0]
+        loftr_matcher = GPULoFTRMatcher(device_id, cfg)
+        
+        for round_key, files in rounds.items():
+            try:
+                dapi_file = next((f for f in files if "_ch00.tif" in f.name), None)
+                if dapi_file is None:
+                    continue
+                
+                with torch.cuda.device(device_id):
+                    device = torch.device(f"cuda:{device_id}")
+                    dapi_small = load_tif_vips(preproc_cache[dapi_file.stem], is_8bit=cfg.use_8bit_processing)
+                    ref_small = cv2.resize(ref_full, (dapi_small.shape[1], dapi_small.shape[0]))
+                    
+                    ref_t = to_gpu_tensor(ref_small, device, is_8bit=cfg.use_8bit_processing)
+                    mov_t = to_gpu_tensor(dapi_small, device, is_8bit=cfg.use_8bit_processing)
+                    M_coarse = GPUFeatureMatcher(device_id, is_8bit=cfg.use_8bit_processing).coarse_align(ref_t, mov_t).unsqueeze(0)
+                    
+                    # CRITICAL FIX: Invert the transformation matrix here
+                    M_homogeneous = torch.eye(3, dtype=torch.float32, device=device)
+                    M_homogeneous[:2, :] = M_coarse[0]
+                    M_inv = torch.inverse(M_homogeneous)
+                    M_forward = M_inv[:2, :].unsqueeze(0)
+                    
+                    # Apply the CORRECT transformation
+                    dapi_warped_t = warp_affine(mov_t, M_forward, mov_t.shape[2:], mode='bilinear', padding_mode='reflection')
+                    dapi_warped = from_gpu_tensor(dapi_warped_t, is_8bit=cfg.use_8bit_processing).astype(np.float32)
+                    del ref_t, mov_t, dapi_warped_t
+                    cleanup_memory(device_id)
+                    
+                    keypoints_ref, keypoints_mov = loftr_matcher.match_images(ref_small, dapi_warped)
+                    M_final = M_coarse.clone()
+                    if len(keypoints_ref) > 10:
+                        try:
+                            M_cv, inliers = cv2.estimateAffinePartial2D(
+                                keypoints_mov.astype(np.float32),
+                                keypoints_ref.astype(np.float32),
+                                method=cv2.RANSAC
+                            )
+                            if M_cv is not None and inliers.sum() > 5:
+                                M_final = torch.tensor(M_cv, dtype=torch.float32, device=device).unsqueeze(0)
+                        except:
+                            pass
+                    
+                    # CRITICAL FIX: Invert the final transformation matrix
+                    M_homogeneous = torch.eye(3, dtype=torch.float32, device=device)
+                    M_homogeneous[:2, :] = M_final[0]
+                    M_inv = torch.inverse(M_homogeneous)
+                    M_forward = M_inv[:2, :]
+                    
+                    # Scale up to full resolution
+                    scale_factor = 1.0 / cfg.coarse_downscale
+                    M_full = M_forward.clone().unsqueeze(0)
+                    M_full[0, :2, 2] *= scale_factor
+                    
+                    # Queue the CORRECT transformation
+                    transform_queue.put((round_key, files, M_full.cpu()))
+            
+            except Exception as e:
+                print(f"Matching error for round {round_key}: {e}")
+                cleanup_memory(device_id)
+        
+        transform_queue.put(None)
+        loftr_matcher.cleanup()
+    
+    def transformation_worker():
+        device_id = cfg.gpu_devices[1]
+        results = []
+        
+        while True:
+            item = transform_queue.get()
+            if item is None:
+                break
+            
+            round_key, files, M_full_cpu = item
+            
+            try:
+                with torch.cuda.device(device_id):
+                    device = torch.device(f"cuda:{device_id}")
+                    M_full = M_full_cpu.to(device)
+                    
+                    # Create validation directory
+                    validation_dir = Path(cfg.output_folder) / "validation"
+                    validation_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    for i, f in enumerate(files):
+                        try:
+                            full_img = load_tif_vips(f, is_8bit=cfg.use_8bit_processing)
+                            channel_name = f.stem.split('_')[-1] if '_ch' in f.stem else "unknown"
+                            
+                            # Transform image
+                            transformed_img = transform_image_tiled_gpu_no_gaps(
+                                full_img, M_full, device_id, cfg,
+                                progress_prefix=f"Pipeline {round_key} Ch{i+1}: "
+                            )
+                            
+                            # Save transformed image
+                            output_path = Path(cfg.output_folder) / f"{f.stem}_registered.tif"
+                            save_tif(output_path, transformed_img, save_as_8bit=cfg.use_8bit_processing)
+                            
+                            del full_img, transformed_img
+                            cleanup_memory(device_id)
+                        except Exception as e:
+                            print(f"Transformation error for channel {i+1} of round {round_key}: {e}")
+                            cleanup_memory(device_id)
+                    
+                    results.append(f"GPU {device_id}: Round {round_key} completed successfully")
+            
+            except Exception as e:
+                results.append(f"GPU {device_id}: Round {round_key} failed: {e}")
+                cleanup_memory(device_id)
+        
+        # Save results
+        summary_path = Path(cfg.output_folder) / "alignment_summary.json"
+        success_count = sum(1 for r in results if "completed successfully" in r)
+        
+        summary = {
+            "total_rounds": len(rounds),
+            "successful_rounds": success_count,
+            "failed_rounds": len(rounds) - success_count,
+            "results": results,
+            "timestamp": time.time()
+        }
+        
+        with open(str(summary_path), 'w') as f:
+            json.dump(summary, f, indent=2)
+        
+        print(f"\nAlignment Summary:")
+        print(f"  Total rounds: {len(rounds)}")
+        print(f"  Successful: {success_count}")
+        print(f"  Failed: {len(rounds) - success_count}")
+        print(f"  Summary report saved to: {summary_path}")
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        matching_future = executor.submit(matching_worker)
+        transform_future = executor.submit(transformation_worker)
+        matching_future.result()
+        transform_future.result()
+
+# ---------------- Strategy 3: Tiled Parallelization ----------------
+def run_tiled_parallelization_strategy(cfg: DualGPUConfig):
+    print("=== Tiled Parallelization Strategy (CENTERED PADDED, NO GAPS) ===")
+    preproc_cache = preprocess_dapi_cpu(cfg)
+    ref_full = load_tif_vips(Path(cfg.reference_dapi_file), is_8bit=cfg.use_8bit_processing)
+    
+    if cfg.apply_clahe:
+        ref_full = cpu_clahe(ref_full, cfg.clahe_clip, cfg.clahe_grid, is_8bit=cfg.use_8bit_processing)
+    print(f"CENTERED padded reference image shape: {ref_full.shape}")
+    
+    rounds = group_rounds(Path(cfg.input_folder))
+    
+    results = []
+    for round_key, files in tqdm(rounds.items(), desc="Rounds"):
+        try:
+            dapi_file = next((f for f in files if "_ch00.tif" in f.name), None)
+            if dapi_file is None:
+                continue
+            
+            with torch.cuda.device(cfg.gpu_devices[0]):
+                device = torch.device(f"cuda:{cfg.gpu_devices[0]}")
+                dapi_small = load_tif_vips(preproc_cache[dapi_file.stem], is_8bit=cfg.use_8bit_processing)
+                ref_small = cv2.resize(ref_full, (dapi_small.shape[1], dapi_small.shape[0]))
+                
+                ref_t = to_gpu_tensor(ref_small, device, is_8bit=cfg.use_8bit_processing)
+                mov_t = to_gpu_tensor(dapi_small, device, is_8bit=cfg.use_8bit_processing)
+                M_coarse = GPUFeatureMatcher(cfg.gpu_devices[0], is_8bit=cfg.use_8bit_processing).coarse_align(ref_t, mov_t).unsqueeze(0)
+                
+                # CRITICAL FIX: Invert the transformation matrix here
+                M_homogeneous = torch.eye(3, dtype=torch.float32, device=device)
+                M_homogeneous[:2, :] = M_coarse[0]
+                M_inv = torch.inverse(M_homogeneous)
+                M_forward = M_inv[:2, :].unsqueeze(0)
+                
+                # Apply the CORRECT transformation
+                dapi_warped_t = warp_affine(mov_t, M_forward, mov_t.shape[2:], 
+                                          mode='bilinear', padding_mode='reflection')
+                dapi_warped = from_gpu_tensor(dapi_warped_t, is_8bit=cfg.use_8bit_processing).astype(np.float32)
+                del ref_t, mov_t, dapi_warped_t
+                cleanup_memory(cfg.gpu_devices[0])
+                
+                loftr_matcher = GPULoFTRMatcher(cfg.gpu_devices[0], cfg)
+                keypoints_ref, keypoints_mov = loftr_matcher.match_images(ref_small, dapi_warped)
+                loftr_matcher.cleanup()
+                
+                M_final = M_coarse.clone()
+                if len(keypoints_ref) > 10:
+                    try:
+                        M_cv, inliers = cv2.estimateAffinePartial2D(
+                            keypoints_mov.astype(np.float32),
+                            keypoints_ref.astype(np.float32),
+                            method=cv2.RANSAC,
+                            ransacReprojThreshold=2.0
+                        )
+                        if M_cv is not None and inliers.sum() > 5:
+                            M_final = torch.tensor(M_cv, dtype=torch.float32, device=device).unsqueeze(0)
+                    except Exception:
+                        pass
+                
+                # CRITICAL FIX: Invert the final transformation matrix
+                M_homogeneous = torch.eye(3, dtype=torch.float32, device=device)
+                M_homogeneous[:2, :] = M_final[0]
+                M_inv = torch.inverse(M_homogeneous)
+                M_forward = M_inv[:2, :]
+                
+                # Scale up to full resolution
+                scale_factor = 1.0 / cfg.coarse_downscale
+                M_full = M_forward.clone().unsqueeze(0)
+                M_full[0, :2, 2] *= scale_factor
+                
+                # Calculate alignment metrics
+                alignment_metrics = calculate_alignment_metrics(
+                    ref_full, load_tif_vips(dapi_file, is_8bit=cfg.use_8bit_processing), 
+                    M_full[0].cpu().numpy(),
+                    is_8bit=cfg.use_8bit_processing
+                )
+                
+                # Create validation directory
+                validation_dir = Path(cfg.output_folder) / "validation"
+                validation_dir.mkdir(parents=True, exist_ok=True)
+                
+                # Create visualization
+                viz_path = validation_dir / f"alignment_visualization_{round_key}_ch00.png"
+                visualize_alignment(
+                    ref_full, 
+                    load_tif_vips(dapi_file, is_8bit=cfg.use_8bit_processing), 
+                    M_full[0].cpu().numpy(),
+                    viz_path,
+                    round_key,
+                    "DAPI",
+                    is_8bit=cfg.use_8bit_processing
+                )
+                
+                # Check if alignment is acceptable
+                if not alignment_metrics.get("alignment_valid", False):
+                    print(f"WARNING: Poor alignment detected for round {round_key} (DAPI)")
+                    print(f"  Cross-correlation: {alignment_metrics.get('cross_correlation', 0):.4f}")
+                    print(f"  MSE: {alignment_metrics.get('mse', 0):.2f}")
+                    print(f"  Check visualization at: {viz_path}")
+                
+                # Transform all channels
+                for i, f in enumerate(files):
+                    try:
+                        full_img = load_tif_vips(f, is_8bit=cfg.use_8bit_processing)
+                        channel_name = f.stem.split('_')[-1] if '_ch' in f.stem else "unknown"
+                        
+                        # Transform image
+                        transformed_img = transform_image_tiled_gpu_no_gaps(
+                            full_img, M_full, cfg, 
+                            progress_prefix=f"Round {round_key} Ch{i+1}: "
+                        )
+                        
+                        # Save transformed image
+                        output_path = Path(cfg.output_folder) / f"{f.stem}_registered.tif"
+                        save_tif(output_path, transformed_img, save_as_8bit=cfg.use_8bit_processing)
+                        
+                        del full_img, transformed_img
+                        cleanup_memory()
+                    except Exception as e:
+                        print(f"Error transforming channel {i+1} of round {round_key}: {e}")
+                        cleanup_memory()
+            
+            results.append(f"Round {round_key} completed successfully")
+        
+        except Exception as e:
+            results.append(f"Round {round_key} failed: {e}")
+            cleanup_memory()
+    
+    # Generate summary report
+    summary_path = Path(cfg.output_folder) / "alignment_summary.json"
+    success_count = sum(1 for r in results if "completed successfully" in r)
+    
+    summary = {
+        "total_rounds": len(rounds),
+        "successful_rounds": success_count,
+        "failed_rounds": len(rounds) - success_count,
+        "results": results,
+        "timestamp": time.time()
+    }
+    
+    with open(str(summary_path), 'w') as f:
+        json.dump(summary, f, indent=2)
+    
+    print(f"\nAlignment Summary:")
+    print(f"  Total rounds: {len(rounds)}")
+    print(f"  Successful: {success_count}")
+    print(f"  Failed: {len(rounds) - success_count}")
+    print(f"  Summary report saved to: {summary_path}")
+
+# ---------------- Main Pipeline ----------------
+def run_dual_gpu_pipeline(cfg: DualGPUConfig):
+    start_time = time.time()
+    ensure_dir(Path(cfg.output_folder))
+    ensure_dir(Path(cfg.cache_folder))
+    
+    print(f"Starting CENTERED PADDED dual GPU registration (NO GAPS) with 8-bit conversion")
+    print(f"Using {len(cfg.gpu_devices)} GPUs: {cfg.gpu_devices}")
+    print(f"Strategy: {cfg.parallelization_strategy}")
+    print(f"CENTERED padding enabled: {cfg.use_padding}")
+    print(f"8-bit processing: {cfg.use_8bit_processing}")
+    
+    if cfg.parallelization_strategy == "rounds":
+        run_parallel_rounds_strategy(cfg)
+    elif cfg.parallelization_strategy == "pipeline":
+        run_pipeline_strategy(cfg)
+    elif cfg.parallelization_strategy == "tiles":
+        run_tiled_parallelization_strategy(cfg)
+    else:
+        raise ValueError(f"Unknown strategy: {cfg.parallelization_strategy}")
+    
+    elapsed = (time.time() - start_time) / 60
+    print(f"\nCENTERED PADDED dual GPU pipeline (NO GAPS) completed in {elapsed:.2f} minutes")
+    
+    # Final summary
+    print("\nAlignment Validation Summary:")
+    print("  - Comprehensive metrics saved in validation/ directory")
+    print("  - Visualizations show alignment quality for each round")
+    print("  - Check alignment_summary.json for overall success rate")
+    print("  - Review warnings for potential alignment issues")
+
+# ---------------- Configuration ----------------
+if __name__ == "__main__":
+    cfg = DualGPUConfig(
+        input_folder="your input folder path",
+        output_folder="your input folder path/output",
+        cache_folder="... registration_cache_dual_centered_padded",
+        reference_dapi_file="your reference image path",
+        gpu_devices=[0, 1],
+        parallelization_strategy="pipeline",  # Try "rounds", "pipeline", or "tiles"
+        use_padding=True,  # CENTERED PADDING ENABLED
+        use_8bit_processing=True,  # Enable 8-bit conversion for memory efficiency
+        max_full_image_pixels=5000000,
+        mixed_precision=True,
+        max_transform_memory_gb=2.5,
+        tile_size_large=4096,
+        tile_overlap=128,
+        min_tile_size=512
+    )
+    
+    if torch.cuda.device_count() < 2:
+        print("Warning: Less than 2 GPUs available, falling back to single GPU")
+        cfg.gpu_devices = [0]
+    
+    run_dual_gpu_pipeline(cfg)
