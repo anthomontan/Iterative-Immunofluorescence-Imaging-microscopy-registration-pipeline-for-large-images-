@@ -3,6 +3,8 @@
 
 A robust microscopy image registration pipeline using CENTERED padding strategy with automatic hardware detection (GPU/CPU).
 
+Inspired using VALIS for registration, visit their Github for more info and more options :D
+
 ## Features
 
 - CENTERED padding for proper alignment across all images
