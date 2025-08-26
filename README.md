@@ -31,6 +31,17 @@ pip install torch opencv-python kornia pyvips tifffile numpy matplotlib
 ## Usage
 
 Use the Jupyter notebook
+Images must follow this logic : 
+
+filename_ch00.tif (DAPI)
+filename_ch01.tif
+filename_ch02.tif
+filename_ch03.tif 
+....
+
+All images will be converted to 8 bits, padded (centered ) to the maximum image sizes of your datatset, then all ch00 (DAPI) will be downscale (downscale factor) then CLAHE is applied to help registration, then downscale images will be registered coarsly then micro registration is done using Kornia.Next the registration matrix are applied to the full scale padded images, and images are saved on disk.
+
+Visualisation is optional and help to measure registration correlations.
 
 ##  Parameters to edit :
 
